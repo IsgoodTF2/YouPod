@@ -505,6 +505,9 @@ kbd {
 .sp-paste .seg { gap: 0; align-self: flex-start; background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.14); border-radius: 999px; padding: 3px; }
 .sp-paste .seg button { background: transparent; color: var(--muted); border-radius: 999px; padding: 5px 14px; }
 .sp-paste .seg button[aria-pressed="true"] { background: var(--yt); color: #fff; }
+.yt-search-btn { align-self: flex-start; font-size: 13px; font-weight: 700; color: #fff; background: var(--yt); text-decoration: none; border-radius: 999px; padding: 7px 14px; }
+.yt-search-btn:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.sp-paste label[for="linkIn"] { margin-top: 6px; font-weight: 600; color: var(--muted); }
 .sp-paste p { margin: 0; font-size: 12px; color: var(--muted); min-height: 1.2em; }
 
 /* custom body colour */
@@ -637,6 +640,10 @@ kbd {
     </div>
     <div><input id="findIn" type="search" placeholder="Song or artist" autocomplete="off" enterkeyhint="search"><button type="submit">Search</button></div>
     <p id="findMsg" role="status"></p>
+    <a class="yt-search-btn" id="ytSearchBtn" href="https://www.youtube.com/" target="_blank" rel="noopener" hidden>Search on YouTube ↗</a>
+    <label for="linkIn">Or paste a YouTube link</label>
+    <div><input id="linkIn" type="url" inputmode="url" placeholder="youtube.com/watch?v=… or a playlist link" autocomplete="off" enterkeyhint="go"><button type="button" id="linkGo">Play</button></div>
+    <p id="linkMsg" role="status"></p>
   </form>
 
   <section class="panel setup" id="setupPanel" hidden aria-label="Set up YouTube search">
@@ -827,7 +834,9 @@ function remember(item) {
 
 /* ---------- YouTube search ----------
    Every search uses part of the key's daily allowance (about 100 searches a
-   day for everyone together), so results are saved for 12 hours. */
+   day for everyone together), so results are saved in this browser: reused
+   for 2 days, kept as a backup for when the day's searches run out, and
+   deleted after 30 days (YouTube's rule for stored API data). */
 // one request to the YouTube Data API, with friendly error messages
 async function ytApi(path, params) {
   if (!CAN_PLAY) throw { message: "Search works on the YouPod website, not inside claude.ai." };
@@ -838,7 +847,7 @@ async function ytApi(path, params) {
   const j = await r.json().catch(() => ({}));
   if (!r.ok) {
     const reason = j.error && j.error.errors && j.error.errors[0] && j.error.errors[0].reason;
-    if (reason === "quotaExceeded" || reason === "dailyLimitExceeded") throw { message: "YouPod has used up today's YouTube searches. They come back tomorrow." };
+    if (reason === "quotaExceeded" || reason === "dailyLimitExceeded" || r.status === 429) throw { quota: true, message: "YouPod's searches for today are used up (they come back tomorrow). Use Search on YouTube, copy a song's link, and paste it in the box under the search." };
     if (reason === "keyInvalid" || r.status === 400) throw { message: "The YouTube key isn't working. Check it in Settings → YouTube Setup." };
     if (r.status === 403) throw { message: "YouTube said no (" + (reason || "403") + "). Check the key's website settings." };
     if (reason === "playlistNotFound" || r.status === 404) throw { message: "That playlist is private or was deleted." };
@@ -846,17 +855,33 @@ async function ytApi(path, params) {
   }
   return j;
 }
-// results are saved for 12 hours, so the same search doesn't use the allowance twice
+// saved answers: fresh for 2 days, a backup when searching fails, gone after 30 days
+const CACHE_FRESH = 2 * 86400000, CACHE_MAX = 30 * 86400000;   // 2 days, 30 days
+function readCache() {
+  const all = load("spotpod-cache", {}) || {};
+  let gone = 0;
+  for (const k of Object.keys(all)) if (!all[k] || !(Date.now() - all[k].t < CACHE_MAX)) { delete all[k]; gone++; }
+  if (gone) store("spotpod-cache", all);
+  return all;
+}
+// "Hardstyle " and "hardstyle" are the same search
+const normQ = q => String(q).toLowerCase().replace(/\s+/g, " ").trim();
 function cached(key, clean, fetcher) {
   key = "v2:" + key;   // v2: results are checked with playableOnly
-  const cache = load("spotpod-cache", {}) || {};
-  const c = cache[key];
-  if (c && Date.now() - c.t < 12 * 3600000 && Array.isArray(c.items)) return Promise.resolve(c.items.map(clean).filter(Boolean));
+  const c = readCache()[key];
+  const saved = () => c && Array.isArray(c.items) ? c.items.map(clean).filter(Boolean) : [];
+  if (c && Date.now() - c.t < CACHE_FRESH) return Promise.resolve(saved());
   return fetcher().then(items => {
-    const all = load("spotpod-cache", {}) || {};
+    const all = readCache();
     all[key] = { t: Date.now(), items };
-    const keep = Object.keys(all).sort((a, b) => all[b].t - all[a].t).slice(0, 40);
+    const keep = Object.keys(all).sort((a, b) => all[b].t - all[a].t).slice(0, 100);
     store("spotpod-cache", Object.fromEntries(keep.map(k => [k, all[k]])));
+    return items;
+  }, err => {
+    // out of searches, or offline: an older saved answer beats an error
+    const items = saved();
+    if (!items.length) throw err;
+    items.stale = true;
     return items;
   });
 }
@@ -881,18 +906,53 @@ async function playableOnly(items) {
   return items.filter(it => ok.has(ytId(it)));
 }
 function ytSearch(q, max = 25) {
-  return cached(q, cleanItem, async () => {
+  return cached(normQ(q), cleanItem, async () => {
     const j = await ytApi("search", { part: "snippet", type: "video", videoEmbeddable: "true", videoCategoryId: "10", safeSearch: "moderate", maxResults: String(max), q });
     return playableOnly((j.items || []).filter(x => x && x.id && x.id.videoId && x.snippet && x.snippet.liveBroadcastContent !== "upcoming")
       .map(x => ytItem(x.id.videoId, decode(x.snippet.title), artistOf(x.snippet.channelTitle))));
   });
 }
+// a pasted YouTube link: a video, a playlist, or both (youtube.com, youtu.be, music.youtube.com, shorts)
+function parseYtLink(text) {
+  const t = String(text).trim();
+  let u;
+  try { u = new URL(/^https?:\/\//i.test(t) ? t : "https://" + t); } catch (e) { return null; }
+  const host = u.hostname.toLowerCase().replace(/^(www|m|music)\./, "");
+  let v = null;
+  if (host === "youtu.be") v = u.pathname.split("/")[1];
+  else if (host === "youtube.com" || host === "youtube-nocookie.com") {
+    v = u.searchParams.get("v");
+    const m = u.pathname.match(/^\/(?:shorts|embed|live)\/([A-Za-z0-9_-]{11})/);
+    if (m) v = m[1];
+  } else return null;
+  const list = u.searchParams.get("list");
+  const out = { v: /^[A-Za-z0-9_-]{11}$/.test(v || "") ? v : null, list: list && /^[A-Za-z0-9_-]{10,64}$/.test(list) ? list : null };
+  return out.v || out.list ? out : null;
+}
+// one video's name and channel: costs 1 unit, not a search
+async function ytVideoInfo(id) {
+  let j;
+  try { j = await ytApi("videos", { part: "snippet,status", id }); }
+  catch (e) { return ytItem(id, "YouTube video", ""); }   // the name can wait; the video can still play
+  const v = (j.items || [])[0];
+  if (!v) throw { message: "That video is private or was deleted." };
+  if (v.status && v.status.embeddable === false) throw { message: "That video's owner doesn't allow it on other websites. It can only play on YouTube." };
+  return ytItem(id, decode(v.snippet.title), artistOf(v.snippet.channelTitle));
+}
+async function ytPlaylistTitle(id) {
+  try {
+    const j = await ytApi("playlists", { part: "snippet", id });
+    const p = (j.items || [])[0];
+    return p ? decode(p.snippet.title) : "YouTube playlist";
+  } catch (e) { return "YouTube playlist"; }
+}
+
 // a YouTube playlist found by search (opens like a folder)
 const PL_ID = /^[A-Za-z0-9_-]{10,64}$/;
 const ytListItem = (id, name, by, t) => ({ kind: "playlist", id, name, by, url: "https://www.youtube.com/playlist?list=" + id, t: t || Date.now() });
 const cleanList = x => x && typeof x.name === "string" && PL_ID.test(x.id) ? ytListItem(x.id, x.name.slice(0, 140), String(x.by || "").slice(0, 80), x.t) : null;
 function ytSearchPlaylists(q) {
-  return cached("playlists:" + q, cleanList, async () => {
+  return cached("playlists:" + normQ(q), cleanList, async () => {
     const j = await ytApi("search", { part: "snippet", type: "playlist", safeSearch: "moderate", maxResults: "25", q });
     return (j.items || []).filter(x => x && x.id && x.id.playlistId && x.snippet)
       .map(x => ytListItem(x.id.playlistId, decode(x.snippet.title), artistOf(x.snippet.channelTitle)));
@@ -921,7 +981,7 @@ function ytPlaylistSongs(id) {
 const shuffled = a => { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
 /* ---------- Recommended ----------
    YouPod learns your taste from ♥ Liked Songs (they count most) and what
-   you've played. Each search is saved for 12 hours, so opening these lists
+   you've played. Each search is saved for 2 days, so opening these lists
    again doesn't use up the daily search allowance. */
 // the artist, from a title like "Ran-D & Adaro - Zombie" (lots of channels re-upload songs), else the channel
 const songArtist = t => (String(t.name).includes(" - ") ? t.name.split(" - ")[0] : String(t.by || ""))
@@ -1246,6 +1306,7 @@ async function refreshSaved() {
   store("spotpod-history", history);
 }
 setInterval(refreshSaved, 6 * 3600000);
+readCache();   // deletes saved search results older than 30 days
 
 // Settings → Delete My Data: wipes everything YouPod saved in this browser
 const SAVED_KEYS = ["tackle-ipod", "tackle-ipod-playlists", "tackle-ipod-battery", "tackle-ipod-links", "tackle-ipod-saveto",
@@ -1558,7 +1619,7 @@ function render() {
       + listHTML([{ label: "Use My YouTube Account", value: S.premium ? "On" : "Off" }, { label: "Sign In to YouTube", chev: true }], "premium");
   } else if (v === "about") {
     html = `<div class="help"><div class="help-inner" style="transform:translateY(${-NAV.help * 18}px)">
-      <p><b>YouPod</b> · version 7</p>
+      <p><b>YouPod</b> · version 8</p>
       <p>Created by <b>Aaron</b>.</p>
       <p>Music plays through YouTube. The video plays on the screen next to the YouPod, and the YouPod is the remote.</p>
       <p class="dim">Playlists: ${playlists.length} · Songs played: ${history.length}</p>
@@ -1573,6 +1634,7 @@ function render() {
       <p><b>Recommended</b> learns from your ♥ Liked Songs and the songs you play. Your Mix mixes artists you like with new ones; New Artists is only new ones.</p>
       <p><b>Like a song:</b> tap the ♡ Like button next to the YouPod, or on Now Playing press the centre button and pick ♥ Like. In any list, press L to like the song you're pointing at. Liked songs show a ♥ and go in Playlists → ♥ Liked Songs.</p>
       <p><b>Search</b> finds songs or whole YouTube playlists. Pick Songs or Playlists next to the search box.</p>
+      <p><b>Paste a link:</b> copy any YouTube song or playlist link and paste it under the search box. It plays without using a search.</p>
       <p><b>Add to a playlist:</b> tap + Add to Playlist next to the YouPod and pick one. In any list, press A to add the song you're pointing at. Or on Now Playing, press the centre button and pick Add to Playlist.</p>
       <p><b>Make a playlist:</b> Playlists → + New Playlist, or pick + New Playlist when adding a song.</p>
       <p><b>Battery:</b> click the charging port on the bottom edge to plug in or unplug.</p>
@@ -1813,18 +1875,64 @@ $("#findPanel").addEventListener("submit", async e => {
   if (BAT.dead) { $("#findMsg").textContent = "The YouPod's battery is empty. Charge it first."; return; }
   if (document.activeElement && document.activeElement.closest("#findPanel")) document.activeElement.blur();   // so the arrow keys move through the results
   $("#findMsg").textContent = "";
+  showYtSearch(null);
   const F = NAV.find = { label: "Search", items: null, loading: true, q, type: findType };
   NAV.sel.find = 0; NAV.top.find = 0;
   if (view() !== "find") push("find");
   render();
   try {
     F.items = await (F.type === "playlists" ? ytSearchPlaylists(q) : ytSearch(q));
+    if (F.items.stale) {
+      $("#findMsg").textContent = "Today's searches are used up, so these are saved results from earlier.";
+      showYtSearch(q);
+    }
   } catch (err) {
-    F.err = ["Search didn't work", String((err && err.message) || "Try again.")];
+    F.err = [err && err.quota ? "Out of searches for today" : "Search didn't work", String((err && err.message) || "Try again.")];
+    showYtSearch(q);
   }
   F.loading = false;
   if (NAV.find === F) render();
 });
+// the backup when YouPod can't search: YouTube's own search page, in a new tab
+function showYtSearch(q) {
+  const a = $("#ytSearchBtn");
+  a.hidden = !q;
+  if (q) {
+    a.href = "https://www.youtube.com/results?search_query=" + encodeURIComponent(q);
+    a.textContent = `Search “${q.length > 30 ? q.slice(0, 29) + "…" : q}” on YouTube ↗`;
+  }
+}
+// paste a link: play the video, or open the playlist like a folder
+async function playLink() {
+  const msg = $("#linkMsg"), text = $("#linkIn").value.trim();
+  if (!text) { msg.textContent = "Paste a YouTube link first."; return; }
+  if (!CAN_PLAY) { msg.textContent = "Links play on the YouPod website, not inside claude.ai."; return; }
+  if (BAT.dead) { msg.textContent = "The YouPod's battery is empty. Charge it first."; return; }
+  const link = parseYtLink(text);
+  if (!link) { msg.textContent = "That doesn't look like a YouTube link. Copy it from the address bar or the Share button on YouTube."; return; }
+  $("#linkIn").blur();
+  if (link.v) {
+    msg.textContent = "Loading…";
+    try {
+      const it = await ytVideoInfo(link.v);
+      msg.textContent = "";
+      $("#linkIn").value = "";
+      playQueue("Pasted link", [it], 0, false);
+      toast("Playing your link. Tap ♡ Like or + Add to Playlist to keep it.", 3500);
+    } catch (err) { msg.textContent = String((err && err.message) || "That link didn't work."); }
+    return;
+  }
+  msg.textContent = "";
+  $("#linkIn").value = "";
+  const L = { label: "YouTube playlist", items: null, loader: async () => {
+    const [title, songs] = await Promise.all([ytPlaylistTitle(link.list), ytPlaylistSongs(link.list)]);
+    L.label = title;
+    return songs;
+  } };
+  openList(L); loadList(L);
+}
+$("#linkGo").addEventListener("click", e => { playLink(); if (e.detail) e.currentTarget.blur(); });
+$("#linkIn").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); playLink(); } });
 
 /* =========================================================
    BUTTONS
